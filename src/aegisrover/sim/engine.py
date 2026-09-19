@@ -92,7 +92,15 @@ class SimulationEngine:
         return out
 
     # -- execution -------------------------------------------------------------
-    def run(self, duration: float, *, on_event: Callable[[Event, SimulationEngine], None] | None = None) -> RunResult:
+    def run(self, duration: float, *, on_event: Callable[[Event, SimulationEngine], None] | None = None,
+            on_step: Callable[[SimulationEngine], None] | None = None) -> RunResult:
+        """Advance the world in fixed steps.
+
+        ``on_step`` fires once per step after events and noise, just before the
+        world integrates. It is the hook coordination layers use to set twists
+        from the current poses; because it runs inside the fixed-step loop the
+        run stays deterministic as long as the callback is deterministic.
+        """
         if duration <= 0:
             raise SimulationError('duration must be positive')
         rng = random.Random(self.seed)
@@ -113,6 +121,8 @@ class SimulationEngine:
                     delta = self.noise(rng, self.step)
                     robot.twist = Twist2(robot.twist.linear + delta.linear,
                                          robot.twist.angular + delta.angular)
+            if on_step is not None:
+                on_step(self)
             poses = self.world.step(self.step)
             trace.append({'time': round(self.time, 9), 'robots': {n: _pose_dict(p) for n, p in poses.items()}})
             remaining -= self.step

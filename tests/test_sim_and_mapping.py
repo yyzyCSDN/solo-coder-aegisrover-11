@@ -1,5 +1,6 @@
 """Acceptance tests for the simulation and mapping domains."""
 import json
+import math
 
 import pytest
 
@@ -7,6 +8,7 @@ from aegisrover.core.types import GridShape, Pose2, Twist2, Vec2
 from aegisrover.mapping.occupancy import LogOddsGrid
 from aegisrover.mapping.revisions import MapFormatError, MapRepository
 from aegisrover.sim.engine import SimulationEngine, SimulationError
+from aegisrover.sim.fleet import ConflictZone, run_fleet
 from aegisrover.sim.scenarios import ScenarioError, ScenarioSpec, ScenarioStore
 from aegisrover.storage.audit import AuditLog
 from aegisrover.storage.repository import Repository
@@ -243,3 +245,77 @@ def test_map_format_roundtrip_and_migration():
     legacy = json.dumps({'width': 2, 'height': 2, 'cells': [0, 1, 2, 3]})
     migrated = MapRepository.decode(MapRepository.migrate(legacy))
     assert migrated['cells'] == {'0,0': 0, '1,0': 1, '0,1': 2, '1,1': 3}
+
+
+# ------------------------------------------------------------------------------- fleet coordination
+def crossing_world(distance=4.0):
+    """Four robots heading straight through one intersection from the four arms."""
+    starts = {
+        'r-north': (0.0, distance, -math.pi / 2),
+        'r-east': (distance, 0.0, math.pi),
+        'r-south': (0.0, -distance, math.pi / 2),
+        'r-west': (-distance, 0.0, 0.0),
+    }
+    routes = {
+        'r-north': [(0.0, -distance)],
+        'r-east': [(-distance, 0.0)],
+        'r-south': [(0.0, distance)],
+        'r-west': [(distance, 0.0)],
+    }
+    return starts, routes
+
+
+def test_engine_on_step_hook_fires_once_per_step():
+    engine = SimulationEngine(step=0.1)
+    engine.add_robot('r1')
+    calls = []
+    engine.run(0.5, on_step=lambda eng: calls.append(round(eng.time, 9)))
+    assert calls == [0.1, 0.2, 0.3, 0.4, 0.5]
+
+
+def test_fleet_priority_policy_orders_waits_and_never_deadlocks():
+    starts, routes = crossing_world()
+    _, report = run_fleet(starts, routes, [ConflictZone('cross', 0.0, 0.0, 1.0)],
+                          duration=30.0, policy='priority')
+    assert all(report.finished.values())
+    assert report.deadlocks == ()
+    # default priorities follow name order: r-west crosses first, r-east last
+    assert report.waited('r-west') == 0.0
+    assert report.waited('r-east') > report.waited('r-north') > report.waited('r-south') > 0.0
+    for episode in report.episodes:
+        assert episode.zone == 'cross' and episode.duration > 0.0
+    for robot in routes:  # episode durations add up to the per-robot totals
+        total = sum(e.duration for e in report.episodes if e.robot == robot)
+        assert total == pytest.approx(report.waited(robot))
+
+
+def test_fleet_right_hand_policy_interlocks_and_is_reported():
+    starts, routes = crossing_world()
+    _, report = run_fleet(starts, routes, [ConflictZone('cross', 0.0, 0.0, 1.0)],
+                          duration=20.0, policy='right_hand')
+    assert not any(report.finished.values())
+    assert len(report.deadlocks) == 1
+    deadlock = report.deadlocks[0]
+    assert deadlock.robots == ('r-east', 'r-north', 'r-south', 'r-west')
+    assert deadlock.zones == ('cross',)
+    assert deadlock.ongoing and deadlock.duration > 10.0
+    for robot in routes:
+        assert report.waited(robot) > 10.0
+    json.dumps(report.to_dict())  # the report must stay serialisable
+
+
+def test_fleet_runs_are_reproducible():
+    starts, routes = crossing_world()
+    zones = [ConflictZone('cross', 0.0, 0.0, 1.0)]
+    first_result, first_report = run_fleet(starts, routes, zones, duration=20.0, policy='right_hand')
+    second_result, second_report = run_fleet(starts, routes, zones, duration=20.0, policy='right_hand')
+    assert first_result.digest == second_result.digest
+    assert first_report.to_dict() == second_report.to_dict()
+
+
+def test_fleet_without_perception_never_yields():
+    starts, routes = crossing_world()
+    _, report = run_fleet(starts, routes, [ConflictZone('cross', 0.0, 0.0, 1.0)],
+                          duration=15.0, policy='right_hand', sensor_radius=0.0)
+    assert all(report.finished.values())
+    assert report.episodes == () and report.deadlocks == ()
